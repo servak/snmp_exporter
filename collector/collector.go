@@ -21,7 +21,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
@@ -76,46 +75,101 @@ func listToOid(l []int) string {
 	return strings.Join(result, ".")
 }
 
-type ScrapeResults struct {
-	pdus    []gosnmp.SnmpPDU
-	packets uint64
-	retries uint64
+func NewScrapeResults() ScrapeResults {
+	return ScrapeResults{
+		pdus:      []gosnmp.SnmpPDU{},
+		totalPdus: map[string]uint64{},
+		packets:   map[string]uint64{},
+		retries:   map[string]uint64{},
+	}
 }
 
-func ScrapeTarget(ctx context.Context, target string, auth *config.Auth, module *config.Module, logger log.Logger, metrics Metrics) (ScrapeResults, error) {
-	results := ScrapeResults{}
+type ScrapeResults struct {
+	pdus      []gosnmp.SnmpPDU
+	name      string
+	totalPdus map[string]uint64
+	packets   map[string]uint64
+	retries   map[string]uint64
+}
+
+func (s *ScrapeResults) setCount(n string) {
+	s.name = n
+	if _, ok := s.packets[n]; !ok {
+		s.packets[n] = 0
+	}
+	if _, ok := s.retries[n]; !ok {
+		s.retries[n] = 0
+	}
+}
+
+func (s *ScrapeResults) addPdus(n string, pdus ...gosnmp.SnmpPDU) {
+	if _, ok := s.totalPdus[n]; !ok {
+		s.totalPdus[n] = 0
+	}
+	s.totalPdus[n] += uint64(len(pdus))
+	s.pdus = append(s.pdus, pdus...)
+}
+
+func (s *ScrapeResults) incrementPacket() {
+	s.packets[s.name]++
+}
+
+func (s *ScrapeResults) incrementRetrie() {
+	s.retries[s.name]++
+}
+
+func NewOidManager() *oidManager {
+	return &oidManager{
+		values: map[string][]string{},
+		unique: map[string]bool{},
+	}
+}
+
+type oidManager struct {
+	values map[string][]string
+	unique map[string]bool
+}
+
+func (m *oidManager) AddOids(name string, oids []string) {
+	if _, ok := m.values[name]; !ok {
+		m.values[name] = []string{}
+	}
+	for _, oid := range oids {
+		if _, ok := m.unique[oid]; !ok {
+			m.unique[oid] = true
+			m.values[name] = append(m.values[name], oid)
+		}
+	}
+}
+
+func (m *oidManager) GetOids(name string) []string {
+	return m.values[name]
+}
+
+func ScrapeTarget(ctx context.Context, target string, auth *config.Auth, modules []*NamedModule, rlogger log.Logger, metrics Metrics) (ScrapeResults, error) {
+	results := NewScrapeResults()
 	// Set the options.
 	snmp := gosnmp.GoSNMP{}
 	snmp.Context = ctx
-	snmp.MaxRepetitions = module.WalkParams.MaxRepetitions
-	snmp.Retries = *module.WalkParams.Retries
-	snmp.Timeout = module.WalkParams.Timeout
-	snmp.UseUnconnectedUDPSocket = module.WalkParams.UseUnconnectedUDPSocket
 	snmp.LocalAddr = *srcAddress
 
-	// Allow a set of OIDs that aren't in a strictly increasing order
-	if module.WalkParams.AllowNonIncreasingOIDs {
-		snmp.AppOpts = make(map[string]interface{})
-		snmp.AppOpts["c"] = true
+	// Configure target.
+	if err := configureTarget(&snmp, target); err != nil {
+		return results, err
 	}
 
 	var sent time.Time
 	snmp.OnSent = func(x *gosnmp.GoSNMP) {
 		sent = time.Now()
 		metrics.SNMPPackets.Inc()
-		results.packets++
+		results.incrementPacket()
 	}
 	snmp.OnRecv = func(x *gosnmp.GoSNMP) {
 		metrics.SNMPDuration.Observe(time.Since(sent).Seconds())
 	}
 	snmp.OnRetry = func(x *gosnmp.GoSNMP) {
 		metrics.SNMPRetries.Inc()
-		results.retries++
-	}
-
-	// Configure target.
-	if err := configureTarget(&snmp, target); err != nil {
-		return results, err
+		results.incrementRetrie()
 	}
 
 	// Configure auth.
@@ -133,103 +187,131 @@ func ScrapeTarget(ctx context.Context, target string, auth *config.Auth, module 
 	}
 	defer snmp.Conn.Close()
 
-	// Evaluate rules.
-	newGet := module.Get
-	newWalk := module.Walk
-	for _, filter := range module.Filters {
-		var pdus []gosnmp.SnmpPDU
-		allowedList := []string{}
+	gets := NewOidManager()
+	walks := NewOidManager()
+	for _, m := range modules {
+		logger := log.With(rlogger, "module", m.name)
+		results.setCount(m.name)
+		m.TimeStart()
+		// Evaluate rules.
+		newGet := m.Get
+		newWalk := m.Walk
+		configureWalkParams(&snmp, m.WalkParams)
+		for _, filter := range m.Module.Filters {
+			var pdus []gosnmp.SnmpPDU
+			allowedList := []string{}
 
-		if snmp.Version == gosnmp.Version1 {
-			pdus, err = snmp.WalkAll(filter.Oid)
-		} else {
-			pdus, err = snmp.BulkWalkAll(filter.Oid)
-		}
-		// Do not try to filter anything if we had errors.
-		if err != nil {
-			level.Info(logger).Log("msg", "Error getting OID, won't do any filter on this oid", "oid", filter.Oid)
-			continue
-		}
-
-		allowedList = filterAllowedIndices(logger, filter, pdus, allowedList, metrics)
-
-		// Update config to get only index and not walk them.
-		newWalk = updateWalkConfig(newWalk, filter, logger)
-
-		// Only Keep indices not involved in filters.
-		newCfg := updateGetConfig(newGet, filter, logger)
-
-		// We now add each index from filter to the get list.
-		newCfg = addAllowedIndices(filter, allowedList, logger, newCfg)
-
-		newGet = newCfg
-	}
-
-	getOids := newGet
-	maxOids := int(module.WalkParams.MaxRepetitions)
-	// Max Repetition can be 0, maxOids cannot. SNMPv1 can only report one OID error per call.
-	if maxOids == 0 || snmp.Version == gosnmp.Version1 {
-		maxOids = 1
-	}
-	for len(getOids) > 0 {
-		oids := len(getOids)
-		if oids > maxOids {
-			oids = maxOids
-		}
-
-		level.Debug(logger).Log("msg", "Getting OIDs", "oids", oids)
-		getStart := time.Now()
-		packet, err := snmp.Get(getOids[:oids])
-		if err != nil {
-			if err == context.Canceled {
-				return results, fmt.Errorf("scrape cancelled after %s (possible timeout) getting target %s",
-					time.Since(getInitialStart), snmp.Target)
+			if snmp.Version == gosnmp.Version1 {
+				pdus, err = snmp.WalkAll(filter.Oid)
+			} else {
+				pdus, err = snmp.BulkWalkAll(filter.Oid)
 			}
-			return results, fmt.Errorf("error getting target %s: %s", snmp.Target, err)
-		}
-		level.Debug(logger).Log("msg", "Get of OIDs completed", "oids", oids, "duration_seconds", time.Since(getStart))
-		// SNMPv1 will return packet error for unsupported OIDs.
-		if packet.Error == gosnmp.NoSuchName && snmp.Version == gosnmp.Version1 {
-			level.Debug(logger).Log("msg", "OID not supported by target", "oids", getOids[0])
-			getOids = getOids[oids:]
-			continue
-		}
-		// Response received with errors.
-		// TODO: "stringify" gosnmp errors instead of showing error code.
-		if packet.Error != gosnmp.NoError {
-			return results, fmt.Errorf("error reported by target %s: Error Status %d", snmp.Target, packet.Error)
-		}
-		for _, v := range packet.Variables {
-			if v.Type == gosnmp.NoSuchObject || v.Type == gosnmp.NoSuchInstance {
-				level.Debug(logger).Log("msg", "OID not supported by target", "oids", v.Name)
+			// Do not try to filter anything if we had errors.
+			if err != nil {
+				level.Info(logger).Log("msg", "Error getting OID, won't do any filter on this oid", "oid", filter.Oid)
 				continue
 			}
-			results.pdus = append(results.pdus, v)
+
+			allowedList = filterAllowedIndices(logger, filter, pdus, allowedList, metrics)
+
+			// Update config to get only index and not walk them.
+			newWalk = updateWalkConfig(newWalk, filter, logger)
+
+			// Only Keep indices not involved in filters.
+			newCfg := updateGetConfig(newGet, filter, logger)
+
+			// We now add each index from filter to the get list.
+			newCfg = addAllowedIndices(filter, allowedList, logger, newCfg)
+
+			newGet = newCfg
 		}
-		getOids = getOids[oids:]
+		gets.AddOids(m.name, newGet)
+		walks.AddOids(m.name, newWalk)
+		m.TimeStop()
 	}
 
-	for _, subtree := range newWalk {
-		var pdus []gosnmp.SnmpPDU
-		level.Debug(logger).Log("msg", "Walking subtree", "oid", subtree)
-		walkStart := time.Now()
-		if snmp.Version == gosnmp.Version1 {
-			pdus, err = snmp.WalkAll(subtree)
-		} else {
-			pdus, err = snmp.BulkWalkAll(subtree)
+	for _, m := range modules {
+		logger := log.With(rlogger, "module", m.name)
+		results.setCount(m.name)
+		m.TimeStart()
+		getOids := gets.GetOids(m.name)
+		maxOids := int(m.WalkParams.MaxRepetitions)
+		// Max Repetition can be 0, maxOids cannot. SNMPv1 can only report one OID error per call.
+		if maxOids == 0 || snmp.Version == gosnmp.Version1 {
+			maxOids = 1
 		}
-		if err != nil {
-			if err == context.Canceled {
-				return results, fmt.Errorf("scrape canceled after %s (possible timeout) walking target %s",
-					time.Since(getInitialStart), snmp.Target)
+		for len(getOids) > 0 {
+			oids := len(getOids)
+			if oids > maxOids {
+				oids = maxOids
 			}
-			return results, fmt.Errorf("error walking target %s: %s", snmp.Target, err)
+			level.Debug(logger).Log("msg", "Getting OIDs", "oids", oids)
+			getStart := time.Now()
+			packet, err := snmp.Get(getOids[:oids])
+			if err != nil {
+				if err == context.Canceled {
+					return results, fmt.Errorf("scrape cancelled after %s (possible timeout) getting target %s",
+						time.Since(getInitialStart), snmp.Target)
+				}
+				return results, fmt.Errorf("error getting target %s: %s", snmp.Target, err)
+			}
+			level.Debug(logger).Log("msg", "Get of OIDs completed", "oids", oids, "duration_seconds", time.Since(getStart))
+			// SNMPv1 will return packet error for unsupported OIDs.
+			if packet.Error == gosnmp.NoSuchName && snmp.Version == gosnmp.Version1 {
+				level.Debug(logger).Log("msg", "OID not supported by target", "oids", getOids[0])
+				getOids = getOids[oids:]
+				continue
+			}
+			// Response received with errors.
+			// TODO: "stringify" gosnmp errors instead of showing error code.
+			if packet.Error != gosnmp.NoError {
+				return results, fmt.Errorf("error reported by target %s: Error Status %d", snmp.Target, packet.Error)
+			}
+			for _, v := range packet.Variables {
+				if v.Type == gosnmp.NoSuchObject || v.Type == gosnmp.NoSuchInstance {
+					level.Debug(logger).Log("msg", "OID not supported by target", "oids", v.Name)
+					continue
+				}
+				results.addPdus(m.name, v)
+			}
+			getOids = getOids[oids:]
 		}
-		level.Debug(logger).Log("msg", "Walk of subtree completed", "oid", subtree, "duration_seconds", time.Since(walkStart))
 
-		results.pdus = append(results.pdus, pdus...)
+		for _, subtree := range walks.GetOids(m.name) {
+			var pdus []gosnmp.SnmpPDU
+			level.Debug(logger).Log("msg", "Walking subtree", "oid", subtree)
+			walkStart := time.Now()
+			if snmp.Version == gosnmp.Version1 {
+				pdus, err = snmp.WalkAll(subtree)
+			} else {
+				pdus, err = snmp.BulkWalkAll(subtree)
+			}
+			if err != nil {
+				if err == context.Canceled {
+					return results, fmt.Errorf("scrape canceled after %s (possible timeout) walking target %s",
+						time.Since(getInitialStart), snmp.Target)
+				}
+				return results, fmt.Errorf("error walking target %s: %s", snmp.Target, err)
+			}
+			level.Debug(logger).Log("msg", "Walk of subtree completed", "oid", subtree, "duration_seconds", time.Since(walkStart))
+
+			results.addPdus(m.name, pdus...)
+		}
+		m.TimeStop()
 	}
 	return results, nil
+}
+
+func configureWalkParams(g *gosnmp.GoSNMP, walkParams config.WalkParams) {
+	g.MaxRepetitions = walkParams.MaxRepetitions
+	g.Retries = *walkParams.Retries
+	g.Timeout = walkParams.Timeout
+	g.UseUnconnectedUDPSocket = walkParams.UseUnconnectedUDPSocket
+	// Allow a set of OIDs that aren't in a strictly increasing order
+	g.AppOpts = make(map[string]interface{})
+	if walkParams.AllowNonIncreasingOIDs {
+		g.AppOpts["c"] = true
+	}
 }
 
 func configureTarget(g *gosnmp.GoSNMP, target string) error {
@@ -354,7 +436,17 @@ type Metrics struct {
 
 type NamedModule struct {
 	*config.Module
-	name string
+	name  string
+	now   time.Time
+	spent time.Duration
+}
+
+func (m *NamedModule) TimeStart() {
+	m.now = time.Now()
+}
+
+func (m *NamedModule) TimeStop() {
+	m.spent += time.Since(m.now)
 }
 
 func NewNamedModule(name string, module *config.Module) *NamedModule {
@@ -384,94 +476,128 @@ func (c Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc("dummy", "dummy", nil, nil)
 }
 
-func (c Collector) collect(ch chan<- prometheus.Metric, module *NamedModule) {
-	logger := log.With(c.logger, "module", module.name)
+func (c Collector) collect(ch chan<- prometheus.Metric) {
 	start := time.Now()
-	results, err := ScrapeTarget(c.ctx, c.target, c.auth, module.Module, logger, c.metrics)
-	moduleLabel := prometheus.Labels{"module": module.name}
+	results, err := ScrapeTarget(c.ctx, c.target, c.auth, c.modules, c.logger, c.metrics)
 	if err != nil {
-		level.Info(logger).Log("msg", "Error scraping target", "err", err)
-		ch <- prometheus.NewInvalidMetric(prometheus.NewDesc("snmp_error", "Error scraping target", nil, moduleLabel), err)
+		level.Info(c.logger).Log("msg", "Error scraping target", "err", err)
+		ch <- prometheus.NewInvalidMetric(prometheus.NewDesc("snmp_error", "Error scraping target", nil, nil), err)
 		return
 	}
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc("snmp_scrape_walk_duration_seconds", "Time SNMP walk/bulkwalk took.", nil, moduleLabel),
-		prometheus.GaugeValue,
-		time.Since(start).Seconds())
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc("snmp_scrape_packets_sent", "Packets sent for get, bulkget, and walk; including retries.", nil, moduleLabel),
-		prometheus.GaugeValue,
-		float64(results.packets))
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc("snmp_scrape_packets_retried", "Packets retried for get, bulkget, and walk.", nil, moduleLabel),
-		prometheus.GaugeValue,
-		float64(results.retries))
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc("snmp_scrape_pdus_returned", "PDUs returned from get, bulkget, and walk.", nil, moduleLabel),
-		prometheus.GaugeValue,
-		float64(len(results.pdus)))
+	for _, module := range c.modules {
+		moduleLabel := prometheus.Labels{"module": module.name}
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc("snmp_scrape_walk_duration_seconds", "Time SNMP walk/bulkwalk took.", nil, moduleLabel),
+			prometheus.GaugeValue,
+			module.spent.Seconds())
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc("snmp_scrape_packets_sent", "Packets sent for get, bulkget, and walk; including retries.", nil, moduleLabel),
+			prometheus.GaugeValue,
+			float64(results.packets[module.name]))
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc("snmp_scrape_packets_retried", "Packets retried for get, bulkget, and walk.", nil, moduleLabel),
+			prometheus.GaugeValue,
+			float64(results.retries[module.name]))
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc("snmp_scrape_pdus_returned", "PDUs returned from get, bulkget, and walk.", nil, moduleLabel),
+			prometheus.GaugeValue,
+			float64(results.totalPdus[module.name]))
+	}
 	oidToPdu := make(map[string]gosnmp.SnmpPDU, len(results.pdus))
 	for _, pdu := range results.pdus {
 		oidToPdu[pdu.Name[1:]] = pdu
 	}
 
-	metricTree := buildMetricTree(module.Metrics)
-	// Look for metrics that match each pdu.
-PduLoop:
-	for oid, pdu := range oidToPdu {
-		head := metricTree
-		oidList := oidToList(oid)
-		for i, o := range oidList {
-			var ok bool
-			head, ok = head.children[o]
-			if !ok {
-				continue PduLoop
-			}
-			if head.metric != nil {
-				// Found a match.
-				samples := pduToSamples(oidList[i+1:], &pdu, head.metric, oidToPdu, logger, c.metrics)
-				for _, sample := range samples {
-					ch <- sample
-				}
-				break
-			}
-		}
+	for _, module := range c.modules {
+		module.TimeStart()
+		metricTree := buildMetricTree(module.Metrics)
+		c.matchAndProcessPdus(oidToPdu, metricTree, ch)
+		module.TimeStop()
 	}
+	// Look for metrics that match each pdu.
+	// PduLoop:
+	// for oid, pdu := range oidToPdu {
+	// 	head := metricTree
+	// 	oidList := oidToList(oid)
+	// 	for i, o := range oidList {
+	// 		var ok bool
+	// 		head, ok = head.children[o]
+	// 		if !ok {
+	// 			continue PduLoop
+	// 		}
+	// 		if head.metric != nil {
+	// 			// Found a match.
+	// 			samples := pduToSamples(oidList[i+1:], &pdu, head.metric, oidToPdu, c.logger, c.metrics)
+	// 			for _, sample := range samples {
+	// 				ch <- sample
+	// 			}
+	// 			break
+	// 		}
+	// 	}
+	// }
 	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc("snmp_scrape_duration_seconds", "Total SNMP time scrape took (walk and processing).", nil, moduleLabel),
+		prometheus.NewDesc("snmp_scrape_duration_seconds", "Total SNMP time scrape took (walk and processing).", nil, nil),
 		prometheus.GaugeValue,
 		time.Since(start).Seconds())
 }
 
+func (c *Collector) matchAndProcessPdus(oidToPdu map[string]gosnmp.SnmpPDU, metricTree *MetricNode, ch chan<- prometheus.Metric) {
+	head := metricTree
+	for oid, pdu := range oidToPdu {
+		if samples, matched := c.findAndProcessMetric(head, oid, &pdu, oidToPdu); matched {
+			for _, sample := range samples {
+				ch <- sample
+			}
+		}
+	}
+}
+
+// findAndProcessMetricは、メトリックツリーを探索して対応するメトリックを見つけ、サンプルを生成します。
+func (c *Collector) findAndProcessMetric(node *MetricNode, oid string, pdu *gosnmp.SnmpPDU, oidToPdu map[string]gosnmp.SnmpPDU) ([]prometheus.Metric, bool) {
+	oidList := oidToList(oid)
+	for i, o := range oidList {
+		next, exists := node.children[o]
+		if !exists {
+			return nil, false
+		}
+		if next.metric != nil {
+			// 対応するメトリックが見つかった場合、サンプルを生成
+			return pduToSamples(oidList[i+1:], pdu, next.metric, oidToPdu, c.logger, c.metrics), true
+		}
+		node = next
+	}
+	return nil, false
+}
+
 // Collect implements Prometheus.Collector.
 func (c Collector) Collect(ch chan<- prometheus.Metric) {
-	wg := sync.WaitGroup{}
-	workerCount := c.concurrency
-	if workerCount < 1 {
-		workerCount = 1
-	}
-	workerChan := make(chan *NamedModule)
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for m := range workerChan {
-				logger := log.With(c.logger, "module", m.name)
-				level.Debug(logger).Log("msg", "Starting scrape")
-				start := time.Now()
-				c.collect(ch, m)
-				duration := time.Since(start).Seconds()
-				level.Debug(logger).Log("msg", "Finished scrape", "duration_seconds", duration)
-				c.metrics.SNMPCollectionDuration.WithLabelValues(m.name).Observe(duration)
-			}
-		}()
-	}
+	// wg := sync.WaitGroup{}
+	// workerCount := c.concurrency
+	// if workerCount < 1 {
+	// 	workerCount = 1
+	// }
+	// workerChan := make(chan *NamedModule)
+	// for i := 0; i < workerCount; i++ {
+	// 	wg.Add(1)
+	// 	go func() {
+	// 		defer wg.Done()
+	// 		for m := range workerChan {
+	// 			logger := log.With(c.logger, "module", m.name)
+	// 			c.metrics.SNMPCollectionDuration.WithLabelValues(m.name).Observe(duration)
+	// 		}
+	// 	}()
+	// }
 
-	for _, module := range c.modules {
-		workerChan <- module
-	}
-	close(workerChan)
-	wg.Wait()
+	// for _, module := range c.modules {
+	// 	workerChan <- module
+	// }
+	// close(workerChan)
+	// wg.Wait()
+	level.Debug(c.logger).Log("msg", "Starting scrape")
+	start := time.Now()
+	c.collect(ch)
+	duration := time.Since(start).Seconds()
+	level.Debug(c.logger).Log("msg", "Finished scrape", "duration_seconds", duration)
 }
 
 func getPduValue(pdu *gosnmp.SnmpPDU) float64 {
